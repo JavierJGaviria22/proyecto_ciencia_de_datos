@@ -72,3 +72,31 @@ def test_evaluate_on_test_returns_metrics(toy):
     res = ml.evaluate_on_test(pipe, X_te, y_te, threshold=0.5)
     assert {"accuracy", "f1", "roc_auc", "n_test"} <= set(res)
     assert 0 <= res["accuracy"] <= 1 and res["n_test"] == len(X_te)
+
+
+def test_save_and_load_roundtrip(tmp_path, toy):
+    X, y = toy
+    pipe = ml.build_pipeline(ml.get_candidates(42)["logreg"]).fit(X, y)
+    path = ml.save_model(pipe, {"estimator": "logreg", "n_train": len(X)},
+                         name="toy_model", models_dir=tmp_path)
+    loaded, meta = ml.load_model(path)
+    assert np.array_equal(pipe.predict(X), loaded.predict(X))     # mismas predicciones
+    assert {"sklearn_version", "python_version", "model_sha256", "saved_at"} <= set(meta)
+    assert meta["n_train"] == len(X)
+
+
+def test_predict_returns_probabilities_and_labels(toy):
+    X, y = toy
+    pipe = ml.build_pipeline(ml.get_candidates(42)["logreg"]).fit(X, y)
+    out = ml.predict(pipe, X, threshold=0.5)
+    assert list(out.columns) == ["proba_survive", "pred"]
+    assert set(out["pred"].unique()) <= {0, 1}
+
+
+def test_bootstrap_ci_is_ordered(toy):
+    X, y = toy
+    X_tr, X_te, y_tr, y_te = ml.split(X, y, test_size=0.25, random_state=1)
+    pipe = ml.build_pipeline(ml.get_candidates(42)["logreg"]).fit(X_tr, y_tr)
+    ci = ml.bootstrap_ci(pipe, X_te, y_te, n_boot=50, random_state=0)
+    assert set(ci) == {"accuracy", "f1", "roc_auc"}
+    assert all(0 <= lo <= hi <= 1 for lo, hi in ci.values())
