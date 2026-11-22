@@ -30,4 +30,8 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["T2_Titanic_Javier_Gaviria.ipynb"]   # cuaderno de referencia de Colab
+
+[tool.ruff.lint]
+ignore = ["N999"]   # los módulos de flows/ empiezan por un número (orden de las etapas)
 
