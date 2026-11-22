@@ -11,7 +11,8 @@ from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -101,4 +102,50 @@ def get_candidates(random_state: int = 42) -> dict:
         "forest": RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1),
         "hgb": HistGradientBoostingClassifier(random_state=random_state),
         "knn": KNeighborsClassifier(),
+    }
+
+
+def cross_validate_candidates(X, y, num_features=None, cat_features=None,
+                              random_state=None, cv_folds=None) -> pd.DataFrame:
+    """Devuelve un DataFrame con media y desviación de cada métrica por modelo."""
+    random_state = settings.random_state if random_state is None else random_state
+    cv_folds = settings.cv_folds if cv_folds is None else cv_folds
+    cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
+
+    filas = {}
+    for nombre, modelo in get_candidates(random_state).items():
+        pipe = build_pipeline(modelo, num_features, cat_features)
+        res = cross_validate(pipe, X, y, cv=cv, scoring=SCORING, return_train_score=True)
+        fila = {}
+        for metrica in SCORING:
+            fila[f"{metrica}_mean"] = res[f"test_{metrica}"].mean()
+            fila[f"{metrica}_std"] = res[f"test_{metrica}"].std()
+        fila["train_roc_auc_mean"] = res["train_roc_auc"].mean()
+        filas[nombre] = fila
+        log.info("%s: %s=%.3f (+/- %.3f)", nombre, PRIMARY_METRIC,
+                 fila[f"{PRIMARY_METRIC}_mean"], fila[f"{PRIMARY_METRIC}_std"])
+    tabla = pd.DataFrame(filas).T
+    return tabla.sort_values(f"{PRIMARY_METRIC}_mean", ascending=False)
+
+
+def get_param_grids() -> dict[str, dict]:
+    """Rejillas por modelo, con los nombres que espera el Pipeline (prefijo 'model__')."""
+    return {
+        "logreg": {"model__C": [0.01, 0.1, 1, 10], "model__penalty": ["l2"]},
+        "forest": {"model__n_estimators": [200, 400], "model__max_depth": [4, 6, 8, None],
+                   "model__min_samples_leaf": [1, 3, 5]},
+        "hgb": {"model__learning_rate": [0.03, 0.1], "model__max_depth": [2, 3, 4],
+                "model__max_iter": [100, 200], "model__l2_regularization": [0.0, 1.0]},
+    }
+
+
+def evaluate_on_test(pipeline, X_test, y_test, threshold: float = 0.5) -> dict:
+    """Devuelve exactitud, F1, ROC-AUC y el tamaño de la prueba (dict serializable a JSON)."""
+    proba = pipeline.predict_proba(X_test)[:, 1]
+    pred = (proba >= threshold).astype(int)
+    return {
+        "accuracy": float(accuracy_score(y_test, pred)),
+        "f1": float(f1_score(y_test, pred)),
+        "roc_auc": float(roc_auc_score(y_test, proba)),
+        "n_test": len(y_test),
     }
