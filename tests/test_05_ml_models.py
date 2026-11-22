@@ -56,3 +56,19 @@ def test_split_is_stratified_and_reproducible(toy):
 def test_candidates_include_baseline_and_are_seeded():
     cands = ml.get_candidates(42)
     assert "dummy" in cands and "logreg" in cands and len(cands) >= 5
+
+
+def test_cross_validate_candidates_returns_one_row_per_model(toy):
+    X, y = toy
+    out = ml.cross_validate_candidates(X, y, random_state=0, cv_folds=3)
+    assert set(out.index) == set(ml.get_candidates(0))
+    assert "roc_auc_mean" in out.columns and "roc_auc_std" in out.columns
+
+
+def test_evaluate_on_test_returns_metrics(toy):
+    X, y = toy
+    X_tr, X_te, y_tr, y_te = ml.split(X, y, test_size=0.25, random_state=1)
+    pipe = ml.build_pipeline(ml.get_candidates(42)["logreg"]).fit(X_tr, y_tr)
+    res = ml.evaluate_on_test(pipe, X_te, y_te, threshold=0.5)
+    assert {"accuracy", "f1", "roc_auc", "n_test"} <= set(res)
+    assert 0 <= res["accuracy"] <= 1 and res["n_test"] == len(X_te)
