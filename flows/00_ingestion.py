@@ -23,6 +23,8 @@ from flows.common.paths import (
 
 log = get_logger(__name__)
 
+QUALITY_REPORT_NAME = "_quality_report.json"
+
 
 def read_source(source: str) -> pd.DataFrame:
     """Lee la fuente completa (URL o ruta local) sin transformar valores."""
@@ -34,6 +36,22 @@ def split_labeled(df: pd.DataFrame, n_labeled: int) -> tuple[pd.DataFrame, pd.Da
     labeled = df.iloc[:n_labeled].copy()
     unlabeled = df.iloc[n_labeled:].copy().reset_index(drop=True)
     return labeled, unlabeled
+
+
+def quality_report(df: pd.DataFrame) -> dict:
+    """Resumen de calidad: dimensiones, tipos y faltantes por columna.
+
+    Devuelve un dict con las claves:
+      n_rows, n_cols, dtypes ({col: str(dtype)}), nulls ({col: int}), null_pct ({col: float 0-100}).
+    """
+    nulls = df.isnull().sum()
+    return {
+        "n_rows": int(df.shape[0]),
+        "n_cols": int(df.shape[1]),
+        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "nulls": {col: int(n) for col, n in nulls.items()},
+        "null_pct": {col: float(n / len(df) * 100) for col, n in nulls.items()},
+    }
 
 
 def run(source: str | None = None, n_labeled: int | None = None, out_dir: Path = BRONZE) -> dict:
@@ -63,6 +81,9 @@ def run(source: str | None = None, n_labeled: int | None = None, out_dir: Path =
     }
     (out_dir / BRONZE_METADATA_NAME).write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    (out_dir / QUALITY_REPORT_NAME).write_text(
+        json.dumps(quality_report(labeled), indent=2, ensure_ascii=False), encoding="utf-8"
     )
     log.info("Bronze listo: %d etiquetados, %d sin etiqueta", len(labeled), len(unlabeled))
     return metadata
