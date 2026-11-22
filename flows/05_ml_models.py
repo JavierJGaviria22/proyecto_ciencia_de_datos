@@ -1,10 +1,15 @@
 """Modelado: Silver -> modelo entrenado y guardado."""
 from __future__ import annotations
 
+import json
+import platform
+from datetime import UTC, datetime
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyClassifier
@@ -19,8 +24,9 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
 from flows.common.config import settings
+from flows.common.hashing import sha256_of
 from flows.common.logging import get_logger
-from flows.common.paths import SILVER, SILVER_NAME
+from flows.common.paths import MODELS, SILVER, SILVER_NAME
 
 log = get_logger(__name__)
 
@@ -32,6 +38,18 @@ CABIN_CAT = ["TCabin"]
 CANDIDATE_COLUMNS = NUM_FEATURES + CAT_FEATURES + CABIN_NUM + CABIN_CAT
 PRIMARY_METRIC = "roc_auc"
 SCORING = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+
+# --- Decisiones congeladas (resultado del cuaderno 04; justificadas en reports/problema_ml.md) ---
+MODEL_NAME = "titanic_model_v1"
+FINAL_ESTIMATOR = "hgb"                 # nombre en get_candidates()
+FINAL_PARAMS = {                        # mejores hiperparámetros del Paso 57
+    "model__learning_rate": 0.1,
+    "model__max_depth": 2,
+    "model__max_iter": 200,
+    "model__l2_regularization": 1.0,
+}
+USE_CABIN_FEATURES = False              # decisión del Paso 61
+THRESHOLD = 0.43                        # decisión del Paso 53
 
 
 def load_dataset(path: Path | None = None) -> tuple[pd.DataFrame, pd.Series]:
@@ -149,3 +167,108 @@ def evaluate_on_test(pipeline, X_test, y_test, threshold: float = 0.5) -> dict:
         "roc_auc": float(roc_auc_score(y_test, proba)),
         "n_test": len(y_test),
     }
+
+
+def bootstrap_ci(pipeline, X_test, y_test, threshold: float = 0.5, n_boot: int = 1000,
+                 random_state: int | None = None) -> dict:
+    """Intervalo de confianza del 95 % (percentiles 2.5 y 97.5) por bootstrap de (y_test, proba)."""
+    random_state = settings.random_state if random_state is None else random_state
+    rng = np.random.default_rng(random_state)
+    y = np.asarray(y_test)
+    proba = pipeline.predict_proba(X_test)[:, 1]
+    pred = (proba >= threshold).astype(int)
+    valores = {"accuracy": [], "f1": [], "roc_auc": []}
+    for _ in range(n_boot):
+        idx = rng.integers(0, len(y), len(y))
+        if len(np.unique(y[idx])) < 2:      # ROC-AUC necesita las dos clases
+            continue
+        valores["accuracy"].append(accuracy_score(y[idx], pred[idx]))
+        valores["f1"].append(f1_score(y[idx], pred[idx]))
+        valores["roc_auc"].append(roc_auc_score(y[idx], proba[idx]))
+    return {m: [float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))]
+            for m, v in valores.items()}
+
+
+def _final_features() -> tuple[list[str], list[str]]:
+    num = NUM_FEATURES + (CABIN_NUM if USE_CABIN_FEATURES else [])
+    cat = CAT_FEATURES + (CABIN_CAT if USE_CABIN_FEATURES else [])
+    return num, cat
+
+
+def train_final(X: pd.DataFrame, y: pd.Series) -> Pipeline:
+    """Construye el pipeline con las decisiones congeladas y lo entrena con TODO (X, y)."""
+    num, cat = _final_features()
+    modelo = get_candidates(settings.random_state)[FINAL_ESTIMATOR]
+    pipe = build_pipeline(modelo, num, cat).set_params(**FINAL_PARAMS)
+    return pipe.fit(X, y)
+
+
+def save_model(pipeline: Pipeline, metadata: dict, name: str = MODEL_NAME,
+               models_dir: Path = MODELS) -> Path:
+    """Guarda el pipeline (.joblib) y un archivo de metadatos (.metadata.json)."""
+    models_dir = Path(models_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / f"{name}.joblib"
+    joblib.dump(pipeline, model_path)
+    meta = {
+        **metadata,
+        "name": name,
+        "saved_at": datetime.now(UTC).isoformat(),
+        "python_version": platform.python_version(),
+        "sklearn_version": sklearn.__version__,
+        "pandas_version": pd.__version__,
+        "model_sha256": sha256_of(model_path),
+    }
+    (models_dir / f"{name}.metadata.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
+    )
+    log.info("Modelo guardado en %s", model_path)
+    return model_path
+
+
+def load_model(path: Path) -> tuple[Pipeline, dict]:
+    """Carga el pipeline y sus metadatos; avisa si la versión de scikit-learn cambió."""
+    path = Path(path)
+    pipeline = joblib.load(path)
+    meta = json.loads(path.with_suffix(".metadata.json").read_text(encoding="utf-8"))
+    if meta.get("sklearn_version") != sklearn.__version__:
+        log.warning("Modelo entrenado con scikit-learn %s; versión actual %s",
+                    meta.get("sklearn_version"), sklearn.__version__)
+    return pipeline, meta
+
+
+def predict(pipeline: Pipeline, X: pd.DataFrame, threshold: float = THRESHOLD) -> pd.DataFrame:
+    """Devuelve un DataFrame con 'proba_survive' y 'pred' (0/1) para cada fila de X."""
+    proba = pipeline.predict_proba(X)[:, 1]
+    return pd.DataFrame(
+        {"proba_survive": proba, "pred": (proba >= threshold).astype(int)}, index=X.index
+    )
+
+
+def run(in_dir: Path | None = None, models_dir: Path = MODELS) -> Path:
+    """Silver -> evaluación honesta -> modelo final entrenado y guardado."""
+    silver_path = Path(in_dir) / SILVER_NAME if in_dir else SILVER / SILVER_NAME
+    X, y = load_dataset(silver_path)
+    X_tr, X_te, y_tr, y_te = split(X, y)
+
+    # Evaluación honesta: modelo entrenado solo con entrenamiento, evaluado una vez en prueba
+    pipe_eval = train_final(X_tr, y_tr)
+    metrics = evaluate_on_test(pipe_eval, X_te, y_te, THRESHOLD)
+    metrics["ci95"] = bootstrap_ci(pipe_eval, X_te, y_te, THRESHOLD)
+    log.info("Métricas en prueba: %s", metrics)
+
+    # Modelo definitivo: entrenado con TODOS los datos etiquetados
+    pipeline = train_final(X, y)
+    num, cat = _final_features()
+    metadata = {
+        "estimator": FINAL_ESTIMATOR,
+        "params": FINAL_PARAMS,
+        "features": {"numeric": num, "categorical": cat},
+        "target": TARGET,
+        "threshold": THRESHOLD,
+        "random_state": settings.random_state,
+        "n_train": len(X),
+        "data_sha256": sha256_of(silver_path),
+        "metrics": metrics,
+    }
+    return save_model(pipeline, metadata, models_dir=models_dir)
